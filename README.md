@@ -1,5 +1,7 @@
 # Consistency Trajectory Models: Learning Probability Flow ODE Trajectory of Diffusion
 
+## Official repository of CTM 
+
 Code is coming soon.
 
 [arXiv](https://arxiv.org/abs/2310.02279)
