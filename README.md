@@ -1,6 +1,6 @@
 # <span style="color:orange">C</span>onsistency <span style="color:orange">T</span>rajectory <span style="color:orange">M</span>odels: Learning Probability Flow ODE Trajectory of Diffusion
 
-<img src="/assets/icon.png" alt="ctm" width="200"/>
+<img src="/assets/icon.png" alt="ctm" width="100%"/>
 
 - Code is coming soon.
 
