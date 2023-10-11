@@ -1,12 +1,13 @@
-# Consistency Trajectory Models: Learning Probability Flow ODE Trajectory of Diffusion
+# <span style="color:orange">C</span>onsistency <span style="color:orange">T</span>rajectory <span style="color:orange">M</span>odels: Learning Probability Flow ODE Trajectory of Diffusion
 
-## Official repository of CTM 
+![CTM](/assets/icon.png "CTM")
 
-Code is coming soon.
 
-[arXiv](https://arxiv.org/abs/2310.02279)
+- Code is coming soon.
 
-[Project Page](https://consistencytrajectorymodel.github.io/CTM/)
+- [arXiv](https://arxiv.org/abs/2310.02279)
+
+- [Project Page](https://consistencytrajectorymodel.github.io/CTM/)
 
 
 ```
