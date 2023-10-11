@@ -1,7 +1,6 @@
 # <span style="color:orange">C</span>onsistency <span style="color:orange">T</span>rajectory <span style="color:orange">M</span>odels: Learning Probability Flow ODE Trajectory of Diffusion
 
-![CTM](/assets/icon.png "CTM")
-
+<img src="/assets/icon.png" alt="ctm" width="200"/>
 
 - Code is coming soon.
 
