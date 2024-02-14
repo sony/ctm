@@ -6,7 +6,8 @@ This repository houses the PyTorch implementation of the paper titled "Consisten
 
 * [arXiv](https://arxiv.org/abs/2310.02279)
 * [Project Page](https://consistencytrajectorymodel.github.io/CTM/) 
-* [OpenReview](https://openreview.net/forum?id=ymjI8feDTD) 
+* [OpenReview](https://openreview.net/forum?id=ymjI8feDTD)
+* [Codes of other datasets (to be released...)](https://github.com/Kim-Dongjun)
 
 
 ## TL;DR
