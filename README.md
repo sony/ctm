@@ -1,6 +1,6 @@
 # [ICLR'24] Official implementation of Consistency Trajectory Model (CTM)
 
-<img src="/assets/icon.png" alt="ctm" width="100%"/>
+<img src="/assets/icon.png" alt="ctm" width="80%"/>
 
 This repository houses the PyTorch implementation of the paper titled "Consistency Trajectory Models: Learning Probability Flow ODE Trajectory of Diffusion" on ImageNet 64x64, which is presented at ICLR 2024.
 
