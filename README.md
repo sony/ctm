@@ -18,7 +18,7 @@ For single-step diffusion model sampling, our new model, Consistency Trajectory 
 
 ## Checkpoints
 - Put the checkpoints in the file of author_ckpt: https://drive.google.com/drive/folders/1KPF3tWLRad3n18XJ1TD7J04XtoMIQ8QV?usp=sharing
-- 
+- CTM checkpoint: 
 
 
 
