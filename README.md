@@ -9,6 +9,9 @@ This repository houses the PyTorch implementation of the paper titled "Consisten
 * [OpenReview](https://openreview.net/forum?id=ymjI8feDTD)
 * [Codes of other datasets (to be released...)](https://github.com/Kim-Dongjun)
 
+Contacts:
+* Dongjun KIM <a href="dongjun@stanford.edu">dongjun@stanford.edu</a>
+* Chieh-Hsin (Jesse) LAI <a href="chieh-hsin.lai@sony.com">chieh-hsin.lai@sony.com</a>
 
 ## TL;DR
 For single-step diffusion model sampling, our new model, Consistency Trajectory Model (CTM), achieves SOTA on CIFAR-10 (FID 1.73) and ImageNet 64x64 (FID 1.92). CTM offers diverse sampling options and balances computational budget with sample fidelity effectively.
