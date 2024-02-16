@@ -17,8 +17,8 @@ Contacts:
 For single-step diffusion model sampling, our new model, Consistency Trajectory Model (CTM), achieves SOTA on CIFAR-10 (FID 1.73) and ImageNet 64x64 (FID 1.92). CTM offers diverse sampling options and balances computational budget with sample fidelity effectively.
 
 ## Checkpoints
-- Download and put the checkpoints in the file of author_ckpt: https://drive.google.com/drive/folders/1KPF3tWLRad3n18XJ1TD7J04XtoMIQ8QV?usp=sharing
-- CTM checkpoint on ImageNet64 (ema=0.999): https://drive.google.com/file/d/17XHwI5-IDpATRnBsxjOi6YCg1oD3MGC6/view?usp=sharing
+- Download and put the [checkpoints](https://drive.google.com/drive/folders/1KPF3tWLRad3n18XJ1TD7J04XtoMIQ8QV?usp=sharing) in the file of author_ckpt
+- [CTM checkpoint](https://drive.google.com/file/d/17XHwI5-IDpATRnBsxjOi6YCg1oD3MGC6/view?usp=sharing) on ImageNet64 (ema=0.999) 
 
 
 
