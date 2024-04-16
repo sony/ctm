@@ -175,6 +175,7 @@ def model_and_diffusion_defaults(data_name):
         use_scale_shift_norm=True,
         resblock_updown=True,
         use_new_attention_order=False,
+        attention_type='flash',
         learn_sigma=False,
         weight_schedule="uniform",
         weight_schedule_multiplier=1.,
@@ -299,6 +300,7 @@ def create_model_and_diffusion(args, feature_extractor=None, discriminator_featu
             use_fp16=args.use_fp16,
             use_new_attention_order=args.use_new_attention_order,
             training_mode=('teacher' if teacher else args.training_mode),
+            attention_type=args.attention_type,
         )
     diffusion = KarrasDenoiser(
         args=args, schedule_sampler=schedule_sampler,
@@ -327,6 +329,7 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     training_mode='',
+    attention_type='flash',
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -365,6 +368,7 @@ def create_model(
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
         training_mode=training_mode,
+        attention_type=attention_type,
     )
 
 
