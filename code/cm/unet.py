@@ -515,10 +515,9 @@ class QKVAttentionLegacy(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
-        # q, k, v = rearrange(
-        #     qkv, "b (three h d) s -> (b h) (three d) s", three=3, h=self.n_heads
-        # ).split(ch, dim=1)
+        q, k, v = rearrange(
+            qkv, "b (three h d) s -> (b h) (three d) s", three=3, h=self.n_heads
+        ).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
