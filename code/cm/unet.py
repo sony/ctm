@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
+from xformers.components.attention import ScaledDotProduct
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
@@ -309,6 +310,8 @@ class AttentionBlock(nn.Module):
         self.attention_type = attention_type
         if attention_type == "flash":
             self.attention = QKVFlashAttention(channels, self.num_heads)
+        elif attention_type == 'xformer':
+            self.attention = XformersAttention(self.num_heads)
         else:
             # split heads before split qkv
             self.attention = QKVAttentionLegacy(self.num_heads)
@@ -478,6 +481,20 @@ def count_flops_attn(model, _x, y):
     matmul_ops = 2 * b * (num_spatial**2) * c
     model.total_ops += th.DoubleTensor([matmul_ops])
 
+class XformersAttention(nn.Module):
+    def __init__(self, num_heads):
+        super().__init__()
+        self.attention = ScaledDotProduct()
+        self.num_heads = num_heads
+    
+    def forward(self, qkv, attn_mask=None):
+        """
+        input : qkv
+        """
+        q, k, v = rearrange(
+            qkv, "b (three h d) s -> (b h) three s d", three=3, h=self.num_heads
+        ).chunk(3, dim=1)
+        return rearrange(self.attention(q.squeeze(1), k.squeeze(1), v.squeeze(1), attn_mask), "(b h) s d -> b (h d) s", h=self.num_heads)
 
 class QKVAttentionLegacy(nn.Module):
     """
@@ -498,7 +515,9 @@ class QKVAttentionLegacy(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        q, k, v = rearrange(
+            qkv, "b (three h d) s -> (b h) (three d) s", three=3, h=self.n_heads
+        ).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale

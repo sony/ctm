@@ -56,6 +56,7 @@ For single-step diffusion model sampling, our new model, Consistency Trajectory 
     python -m pip install blobfile tqdm numpy scipy pandas Cython piq==0.7.0
     python -m pip install joblib==0.14.0 albumentations==0.4.3 lmdb clip@git+https://github.com/openai/CLIP.git pillow
     python -m pip install flash-attn --no-build-isolation
+    python -m pip install xformers
     python -m pip install mpi4py
     python -m pip install nvidia-ml-py3 timm==0.4.12 legacy dill nvidia-ml-py3
     ```
