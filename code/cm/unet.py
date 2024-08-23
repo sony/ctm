@@ -9,9 +9,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
-from xformers.components.attention import ScaledDotProduct
+# from xformers.components.attention import ScaledDotProduct
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
+from .bf16_util import convert_module_to_bf16
 from .nn import (
     checkpoint,
     conv_nd,
@@ -310,8 +311,8 @@ class AttentionBlock(nn.Module):
         self.attention_type = attention_type
         if attention_type == "flash":
             self.attention = QKVFlashAttention(channels, self.num_heads)
-        elif attention_type == 'xformer':
-            self.attention = XformersAttention(self.num_heads)
+        # elif attention_type == 'xformer':
+        #     self.attention = XformersAttention(self.num_heads)
         else:
             # split heads before split qkv
             self.attention = QKVAttentionLegacy(self.num_heads)
@@ -382,7 +383,7 @@ class FlashAttention(nn.Module):
             batch_size = qkv.shape[0]
             seqlen = qkv.shape[1]
             if key_padding_mask is None:
-                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+                qkv = rearrange(qkv, 'b s ... -> (b s) ...').contiguous()
                 max_s = seqlen
                 cu_seqlens = th.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=th.int32,
                                           device=qkv.device)
@@ -390,19 +391,19 @@ class FlashAttention(nn.Module):
                     qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
                     softmax_scale=self.softmax_scale, causal=causal
                 )
-                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+                output = rearrange(output, '(b s) ... -> b s ...', b=batch_size).contiguous()
             else:
                 nheads = qkv.shape[-2]
-                x = rearrange(qkv, 'b s three h d -> b s (three h d)')
+                x = rearrange(qkv, 'b s three h d -> b s (three h d)').contiguous()
                 x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)
-                x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
+                x_unpad = rearrange(x_unpad, 'nnz (three h d) -> nnz three h d', three=3, h=nheads).contiguous()
                 output_unpad = flash_attn_varlen_qkvpacked_func(
                     x_unpad, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
                     softmax_scale=self.softmax_scale, causal=causal
                 )
                 output = rearrange(pad_input(rearrange(output_unpad, 'nnz h d -> nnz (h d)'),
                                             indices, batch_size, seqlen),
-                                'b s (h d) -> b s h d', h=nheads)
+                                'b s (h d) -> b s h d', h=nheads).contiguous()
         else:
             assert max_s is not None
             output = flash_attn_varlen_qkvpacked_func(
@@ -452,14 +453,14 @@ class QKVFlashAttention(nn.Module):
         #print("attn_mask: ", attn_mask)
         qkv = self.rearrange(
             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
-        )
+        ).contiguous()
         qkv, _ = self.inner_attn(
             qkv.contiguous(),
             key_padding_mask=key_padding_mask,
             need_weights=need_weights,
             causal=self.causal,
         )
-        return self.rearrange(qkv, "b s h d -> b (h d) s")
+        return self.rearrange(qkv, "b s h d -> b (h d) s").contiguous()
 
 
 def count_flops_attn(model, _x, y):
@@ -481,20 +482,20 @@ def count_flops_attn(model, _x, y):
     matmul_ops = 2 * b * (num_spatial**2) * c
     model.total_ops += th.DoubleTensor([matmul_ops])
 
-class XformersAttention(nn.Module):
-    def __init__(self, num_heads):
-        super().__init__()
-        self.attention = ScaledDotProduct()
-        self.num_heads = num_heads
+# class XformersAttention(nn.Module):
+#     def __init__(self, num_heads):
+#         super().__init__()
+#         self.attention = ScaledDotProduct()
+#         self.num_heads = num_heads
     
-    def forward(self, qkv, attn_mask=None):
-        """
-        input : qkv
-        """
-        q, k, v = rearrange(
-            qkv, "b (three h d) s -> (b h) three s d", three=3, h=self.num_heads
-        ).chunk(3, dim=1)
-        return rearrange(self.attention(q.squeeze(1), k.squeeze(1), v.squeeze(1), attn_mask), "(b h) s d -> b (h d) s", h=self.num_heads)
+#     def forward(self, qkv, attn_mask=None):
+#         """
+#         input : qkv
+#         """
+#         q, k, v = rearrange(
+#             qkv, "b (three h d) s -> (b h) three s d", three=3, h=self.num_heads
+#         ).chunk(3, dim=1).contiguous()
+#         return rearrange(self.attention(q.squeeze(1), k.squeeze(1), v.squeeze(1), attn_mask), "(b h) s d -> b (h d) s", h=self.num_heads).contiguous()
 
 class QKVAttentionLegacy(nn.Module):
     """
@@ -517,13 +518,13 @@ class QKVAttentionLegacy(nn.Module):
         ch = width // (3 * self.n_heads)
         q, k, v = rearrange(
             qkv, "b (three h d) s -> (b h) (three d) s", three=3, h=self.n_heads
-        ).split(ch, dim=1)
+        ).split(ch, dim=1).contiguous()
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v)
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype).contiguous()
+        a = th.einsum("bts,bcs->bct", weight, v).contiguous()
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -597,8 +598,8 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, -1),
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, -1))
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype).contiguous()
+        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, -1)).contiguous()
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -652,6 +653,7 @@ class UNetModel(nn.Module):
         num_classes=None,
         use_checkpoint=False,
         use_fp16=False,
+        use_bf16=False,
         num_heads=1,
         num_head_channels=-1,
         num_heads_upsample=-1,
@@ -660,6 +662,7 @@ class UNetModel(nn.Module):
         use_new_attention_order=False,
         training_mode='',
         attention_type='flash',
+        condition_mode=None,
     ):
         super().__init__()
 
@@ -677,11 +680,18 @@ class UNetModel(nn.Module):
         self.conv_resample = conv_resample
         self.num_classes = num_classes
         self.use_checkpoint = use_checkpoint
-        self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.training_mode = training_mode
+        
+        if use_fp16:
+            assert not use_bf16
+        elif use_bf16:
+            assert not use_fp16
+        self.dtype = th.bfloat16 if use_bf16 else th.float16 if use_fp16 else th.float32
+        
+        self.condition_mode = condition_mode
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -701,6 +711,9 @@ class UNetModel(nn.Module):
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
+        
+        in_channels = in_channels * 2 if self.condition_mode == 'concat' else in_channels
+        
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
         )
@@ -851,19 +864,30 @@ class UNetModel(nn.Module):
         """
         Convert the torso of the model to float16.
         """
+        exit()
         self.input_blocks.apply(convert_module_to_f16)
         self.middle_block.apply(convert_module_to_f16)
         self.output_blocks.apply(convert_module_to_f16)
+    
+    def convert_to_bf16(self):
+        """
+        Convert the torso of the model to bfloat16.
+        """
+        exit()
+        self.input_blocks.apply(convert_module_to_bf16)
+        self.middle_block.apply(convert_module_to_bf16)
+        self.output_blocks.apply(convert_module_to_bf16)
 
     def convert_to_fp32(self):
         """
         Convert the torso of the model to float32.
         """
+        exit()
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, s=None, teacher=False):
+    def forward(self, x, timesteps, y=None, s=None, teacher=False, xT=None):
         """
         Apply the model to an input batch.
 
@@ -872,6 +896,10 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
+        
+        if self.condition_mode == 'concat':
+            x = th.cat([x, xT], dim=1)
+            
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
