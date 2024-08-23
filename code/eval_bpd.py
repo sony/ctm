@@ -253,7 +253,7 @@ def main():
             batch, cond = next(data)
             batch = batch.to(dist_util.dev())
             elbo_ = elbo(args, model, diffusion, batch, std_max=std_max, std_min=std_min,
-                         teacher = (args.training_mode != 'ctm')).cpu().detach().numpy()
+                         teacher = (args.training_mode != 'ctm')).detach().cpu().numpy()
             elbos = np.concatenate((elbos, elbo_))
             #print(f"num samples: {batch.shape[0] * (k+1)}, bpd: {elbos.mean()}")
         total_elbos.append(elbos.mean())
@@ -267,7 +267,7 @@ def main():
             batch, cond = next(data)
             batch = batch.to(dist_util.dev())
             likelihood_ = likelihood(args, model, diffusion, batch, std_max=std_max, std_min=std_min,
-                                     teacher=(args.training_mode != 'ctm')).cpu().detach().numpy()
+                                     teacher=(args.training_mode != 'ctm')).detach().cpu().numpy()
             nlls = np.concatenate((nlls, likelihood_))
             print(f"num samples: {batch.shape[0] * (k+1)}, bpd: {nlls.mean()}")
         total_nlls.append(nlls.mean())
@@ -284,7 +284,7 @@ def main():
             batch, cond = next(data)
             batch = batch.to(dist_util.dev())
             elbo_ = elbo(args, model, diffusion, batch, std_max=std_max, std_min=std_min,
-                         teacher=True).cpu().detach().numpy()
+                         teacher=True).detach().cpu().numpy()
             elbos = np.concatenate((elbos, elbo_))
             # print(f"num samples: {batch.shape[0] * (k+1)}, bpd: {elbos.mean()}")
         total_elbos.append(elbos.mean())
@@ -298,7 +298,7 @@ def main():
             batch, cond = next(data)
             batch = batch.to(dist_util.dev())
             likelihood_ = likelihood(args, model, diffusion, batch, std_max=std_max, std_min=std_min,
-                                     teacher=True).cpu().detach().numpy()
+                                     teacher=True).detach().cpu().numpy()
             nlls = np.concatenate((nlls, likelihood_))
             print(f"num samples: {batch.shape[0] * (k + 1)}, bpd: {nlls.mean()}")
         total_nlls.append(nlls.mean())

@@ -210,7 +210,7 @@ def main():
             s_in = samples.new_ones([samples.shape[0]])
             classes = np.load(sample_dirs[k])['arr_1']
             classes_th = th.from_numpy(classes).to(dist_util.dev())
-            log_prob = get_classifier_guidance(classifier, vpsde_, samples, 0.002 * s_in, args.image_size, classes_th, log_prob=True).cpu().detach().numpy().reshape(-1)
+            log_prob = get_classifier_guidance(classifier, vpsde_, samples, 0.002 * s_in, args.image_size, classes_th, log_prob=True).detach().cpu().numpy().reshape(-1)
             log_probs.extend(log_prob)
             all_classes.extend(classes)
         log_probs_all = {i: {} for i in range(1000)}

@@ -349,7 +349,7 @@ class QKVAttentionLegacy(nn.Module):
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype).contiguous()
         a = th.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
 
@@ -384,7 +384,7 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, length),
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype).contiguous()
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
 

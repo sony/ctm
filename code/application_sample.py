@@ -120,9 +120,13 @@ def main():
     itr = 0
     eval_num_samples = 0
     while itr * args.batch_size < args.eval_num_samples:
+        # org
         x_T = generator.randn(
             *(args.batch_size, args.in_channels, args.image_size, args.image_size),
             device=dist_util.dev()) * args.sigma_max
+        # x_T = generator.randn(
+        #     *(args.batch_size, args.in_channels, args.image_size, args.image_size),
+        #     device=dist_util.dev()) * args.sigma_data_end
         #classes = generator.randint(0, 1000, (args.batch_size,))
         if args.large_log:
             print("x_T: ", x_T[0][0][0][0])
@@ -193,13 +197,13 @@ def main():
         sample = sample.contiguous()
 
         if dist.get_rank() == 0:
-            sample = sample.cpu().detach()
+            sample = sample.detach().cpu()
             if args.large_log:
                 print(f"{(itr-1) * args.batch_size} sampling complete...")
 
             if args.save_format == 'npz':
                 if args.class_cond:
-                    np.savez(os.path.join(out_dir, f"sample_out_{args.gamma}_{itr}.npz"), sample.numpy(), classes.cpu().detach().numpy())
+                    np.savez(os.path.join(out_dir, f"sample_out_{args.gamma}_{itr}.npz"), sample.numpy(), classes.detach().cpu().numpy())
                 else:
                     np.savez(os.path.join(out_dir, f"stroke_sample_out_{args.gamma}_{itr}_{ts[0]},{ts[1]}_numgrad_{args.num_gradient_descent}_scale_{args.scale}.npz"), sample.numpy())
             #if args.save_format == 'png' or itr == 1:
