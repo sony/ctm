@@ -208,7 +208,7 @@ class MixedPrecisionTrainer:
 
         #for name, param in self.model.named_parameters():
         #    print(name, param.requires_grad)
-
+        
         if self.use_fp16:
             self.param_groups_and_shapes = get_param_groups_and_shapes(
                 self.model.named_parameters()
@@ -242,7 +242,6 @@ class MixedPrecisionTrainer:
             logger.log(f"Found NaN, decreased lg_loss_scale to {self.lg_loss_scale}")
             zero_master_grads(self.master_params)
             return False
-
         logger.logkv_mean("grad_norm", grad_norm)
         logger.logkv_mean("param_norm", param_norm)
 
