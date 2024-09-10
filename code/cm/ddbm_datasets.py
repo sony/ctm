@@ -131,9 +131,9 @@ class InfiniteBatchSampler(Sampler):
             self.epoch += 1
             p, q = 0, 0
             while p < self.max_p:
-                print(f'p: {p} | q: {q} | max_p: {self.max_p}')
+                # print(f'p: {p} | q: {q} | max_p: {self.max_p}')
                 q = p + self.batch_size
-                print('indices:', self.indices[p: q], '\nlength is', len(self.indices[p: q]))
+                # print('indices:', self.indices[p: q], '\nlength is', len(self.indices[p: q]))
                 yield self.indices[p:q]
                 p = q
             if self.shuffle:
