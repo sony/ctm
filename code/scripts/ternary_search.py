@@ -80,7 +80,7 @@ def main():
                 if args.clip_denoised:
                     denoised = denoised.clamp(-1, 1)
                 return denoised
-
+            # org
             x_T = (
                 generator.randn(
                     *(args.batch_size, 3, args.image_size, args.image_size),
@@ -88,6 +88,13 @@ def main():
                 )
                 * args.sigma_max
             )
+            # x_T = (
+            #     generator.randn(
+            #         *(args.batch_size, 3, args.image_size, args.image_size),
+            #         device=dist_util.dev(),
+            #     )
+            #     * args.sigma_data_end
+            # )
 
             sample = stochastic_iterative_sampler(
                 denoiser,

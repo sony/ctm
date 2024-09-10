@@ -26,11 +26,17 @@ def setup_dist(device_id):
     if dist.is_initialized():
         return
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{(MPI.COMM_WORLD.Get_rank() + device_id) % GPUS_PER_NODE}"
+    # print((MPI.COMM_WORLD.Get_rank() + device_id) % GPUS_PER_NODE)
+    # print(device_id)
+    # exit()
     #os.environ["CUDA_VISIBLE_DEVICES"] = f"{(MPI.COMM_WORLD.Get_rank()) % GPUS_PER_NODE}"
     #os.environ["CUDA_VISIBLE_DEVICES"] = f"0,1,3,4"
 
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
+    # print(backend)
+    # print((MPI.COMM_WORLD.Get_rank() + device_id) % GPUS_PER_NODE)
+    # exit()
 
     if backend == "gloo":
         hostname = "localhost"
@@ -44,6 +50,7 @@ def setup_dist(device_id):
     port = comm.bcast(_find_free_port(), root=0)
     print("hostname, port: ", hostname, port)
     os.environ["MASTER_PORT"] = str(port)
+    # assert backend == 'nccl'
     dist.init_process_group(backend=backend, init_method="env://")
 
 def setup_dist_without_MPI(device_id):
@@ -53,6 +60,11 @@ def setup_dist_without_MPI(device_id):
     if dist.is_initialized():
         return
     backend = "gloo" if not th.cuda.is_available() else "nccl"
+    
+    # print((device_id) % GPUS_PER_NODE)
+    # exit()
+    
+    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{(device_id) % GPUS_PER_NODE}"
 
     os.environ["NCCL_LL_THRESHOLD"] = "0"
     os.environ["NCCL_NSOCKS_PERTHREAD"] = "2"
@@ -64,6 +76,7 @@ def setup_dist_without_MPI(device_id):
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     print("!!: ", world_size, rank, local_rank)
+    # exit()
     world_size = int(world_size)
     rank = int(rank)
     local_rank = int(local_rank)
@@ -96,6 +109,7 @@ def setup_dist_without_MPI(device_id):
     assert dist.get_rank() == rank
     _device = th.device("cuda", local_rank) if th.cuda.is_available() else th.device("cpu")
     th.cuda.set_device(_device)
+    print('GPU Device:', _device)
 
 def dev():
     """

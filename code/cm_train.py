@@ -1,11 +1,12 @@
 """
 Train a diffusion model on images.
 """
-
 import argparse
+from operator import is_
 
 from cm import dist_util, logger
-from cm.image_datasets import load_data
+# from cm.image_datasets import load_data
+from cm.ddbm_datasets import load_data
 from cm.script_util import (
     train_defaults,
     model_and_diffusion_defaults,
@@ -24,8 +25,8 @@ import copy
 import cm.enc_dec_lib as enc_dec_lib
 import torch as th
 
-
 def main():
+    
     args = create_argparser().parse_args()
     if args.use_MPI:
         dist_util.setup_dist(args.device_id)
@@ -34,7 +35,7 @@ def main():
 
     logger.configure(args, dir=args.out_dir)
 
-    logger.log("creating data loader...")
+    logger.log("Creating data loader...")
     if args.batch_size == -1:
         batch_size = args.global_batch_size // dist.get_world_size()
         if args.global_batch_size % dist.get_world_size() != 0:
@@ -44,20 +45,45 @@ def main():
     else:
         batch_size = args.batch_size
 
-    data = load_data(
-        args=args,
-        data_name=args.data_name,
-        data_dir=args.data_dir,
-        batch_size=batch_size,
-        image_size=args.image_size,
-        class_cond=args.class_cond,
-        train_classes=args.train_classes,
-        num_workers=args.num_workers,
-        type=args.type,
-        deterministic=args.deterministic,
-    )
+    augment = None
+    if args.data_name.startswith('edges2'):
+        from datasets.augment import AugmentPipe
+        augment = AugmentPipe(
+                    p=0.12,xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
+                )
+        augment = None
+        
+        data_image_size = args.image_size
+        batch_size = args.batch_size
+        
+        # data_image_size = 64
+        # batch_size = 16
+        
+        perform_test = True
+        data, test_data = load_data(
+            data_dir=args.data_dir,
+            data_name=args.data_name,
+            batch_size=batch_size,
+            image_size=data_image_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        perform_test = False
+        test_data = None
+        data = load_data(
+            args=args,
+            data_name=args.data_name,
+            data_dir=args.data_dir,
+            batch_size=batch_size,
+            image_size=args.image_size,
+            class_cond=args.class_cond,
+            train_classes=args.train_classes,
+            num_workers=args.num_workers,
+            type=args.type,
+            deterministic=args.deterministic,
+        )
 
-    logger.log("creating model and diffusion...")
+    logger.log("Creating model and diffusion...")
     ema_scale_fn = create_ema_and_scales_fn(
         target_ema_mode=args.target_ema_mode,
         start_ema=args.start_ema,
@@ -78,9 +104,13 @@ def main():
     model.train()
     if args.use_fp16:
         model.convert_to_fp16()
+    elif args.use_bf16:
+        model.convert_to_bf16()
 
     if len(args.teacher_model_path) > 0 and not args.self_learn:  # path to the teacher score model.
-        logger.log(f"loading the teacher model from {args.teacher_model_path}")
+        # print("Should not happen, since no teacher model is used.")
+        # exit()
+        logger.log(f"Loading the teacher model from {args.teacher_model_path}.")
         teacher_model, _ = create_model_and_diffusion(args, teacher=True)
         if not args.edm_nn_ncsn and not args.edm_nn_ddpm:
             teacher_model.load_state_dict(
@@ -112,16 +142,29 @@ def main():
             model.model.map_noise.freqs = teacher_model.model.model.map_noise.freqs
         if args.use_fp16:
             teacher_model.convert_to_fp16()
+        elif args.use_bf16:
+            teacher_model.convert_to_bf16()
     else:
         teacher_model = None
-
+    
+    if args.self_learn:
+        assert teacher_model is None
+    
     # load the target model for distillation, if path specified.
 
-    logger.log("creating the target model")
-    target_model, _ = create_model_and_diffusion(args)
+    # if args.start_ema == 0. and args.scale_mode == 'ict_exp':
+    #     logger.log("Target model is going to be equal to the student model (acc. to the iCT paper)!")
+    #     target_model = None
+    # else:
+    logger.log("creating the target model (ie. ema model)")
+    target_model, _ = create_model_and_diffusion(args) # = ema model
 
     target_model.to(dist_util.dev())
     target_model.train()
+
+    # is_nan = th.stack([th.isnan(p).any() for p in target_model.parameters()]).any()
+    # print('isnan', is_nan)
+    # exit()
 
     dist_util.sync_params(target_model.parameters())
     dist_util.sync_params(target_model.buffers())
@@ -131,29 +174,39 @@ def main():
 
     if args.use_fp16:
         target_model.convert_to_fp16()
+    elif args.use_bf16:
+        target_model.convert_to_bf16()
     if args.edm_nn_ncsn:
         target_model.model.map_noise.freqs = teacher_model.model.model.map_noise.freqs
 
-    logger.log("training...")
+    is_I2I: bool = args.is_I2I
+    logger.log(f"Training {'Image' if is_I2I else 'Noise'}-to-Image...")
+    
     CMTrainLoop(
-        model=model,
+        model=model, #< model learns the "score function".
         target_model=target_model,
-        teacher_model=teacher_model,
+        teacher_model=teacher_model, #< teacher model is used to learn the "Paths"
         discriminator=discriminator,
         ema_scale_fn=ema_scale_fn,
         diffusion=diffusion,
         data=data,
         batch_size=batch_size,
         args=args,
+        augment=augment,
+        test_data=test_data,
+        perform_test=perform_test,
+        is_I2I=is_I2I,
     ).run_loop()
 
 def create_argparser():
-    #defaults = dict(data_name='cifar10')
-    defaults = dict(data_name='imagenet64')
+    
+    # defaults = dict(data_name='cifar10')
+    defaults = dict(data_name='edges2handbags')
+    # defaults = dict(data_name='imagenet64')
     defaults.update(train_defaults(defaults['data_name']))
-    defaults.update(model_and_diffusion_defaults(defaults['data_name']))
-    defaults.update(cm_train_defaults(defaults['data_name']))
     defaults.update(ctm_train_defaults(defaults['data_name']))
+    defaults.update(model_and_diffusion_defaults(defaults['data_name'], defaults['is_I2I']))
+    defaults.update(cm_train_defaults(defaults['data_name']))
     defaults.update(ctm_eval_defaults(defaults['data_name']))
     defaults.update(ctm_loss_defaults(defaults['data_name']))
     defaults.update(ctm_data_defaults(defaults['data_name']))
@@ -164,4 +217,5 @@ def create_argparser():
 
 
 if __name__ == "__main__":
+
     main()

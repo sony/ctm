@@ -41,8 +41,8 @@ def load_cifar_10_data(data_dir, negatives=False):
     # 'filenames': list
     # 'labels': list
 
-    # for i in range(1, 6): # 22nd aug: Use 10k from trainset & 10k from testset => 20k for training.
-    for i in range(1, 2):
+    for i in range(1, 6): # 22nd aug: Use 10k from trainset & 10k from testset => 20k for training.
+    # for i in range(1, 2):
         cifar_train_data_dict = unpickle(data_dir + "/data_batch_{}".format(i))
         if i == 1:
             cifar_train_data = cifar_train_data_dict[b'data']
@@ -222,11 +222,11 @@ def load_data(
         )
     if deterministic:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False,
+            dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, pin_memory=True,
         )
     else:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True
+            dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True, pin_memory=True,
         )
     while True:
         yield from loader

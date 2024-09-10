@@ -243,12 +243,13 @@ class Evaluator:
         """
         preds = []
         spatial_preds = []
-        print("batch: ", batches.min(), batches.max())
+        print("batch: ", batches.min(), batches.max(), batches.shape)
         for k in tqdm(range((batches.shape[0] - 1) // self.batch_size + 1)):
             #for batch in tqdm(batches):
-            batch = batches[k * self.batch_size:min((k+1) * self.batch_size, 50000)]
+            # batch = batches[k * self.batch_size:min((k+1) * self.batch_size, 50000)]
+            batch = batches[k * self.batch_size:min((k+1) * self.batch_size, batches.shape[0])]
             batch = batch.astype(np.float32)
-            print(batch.shape)
+            # print(batch.shape)
             pred, spatial_pred = self.sess.run(
                 [self.pool_features, self.spatial_features], {self.image_input: batch}
             )
@@ -264,11 +265,19 @@ class Evaluator:
     ) -> Tuple[FIDStatistics, FIDStatistics]:
         try:
             obj = np.load(npz_path)
+            assert obj is not None
             if "mu" in list(obj.keys()):
                 return FIDStatistics(obj["mu"], obj["sigma"]), FIDStatistics(
                     obj["mu_s"], obj["sigma_s"]
                 )
+            else:
+                print('okay!')
+                a = tuple(self.compute_statistics(x) for x in activations)
+                print('done!')
+                # print(a[0].shape)
+                return a
         except:
+            print('else!')
             a = tuple(self.compute_statistics(x) for x in activations)
             print(a[0].shape)
             return a

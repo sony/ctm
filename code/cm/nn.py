@@ -102,7 +102,7 @@ def mean_flat(tensor, percent='1-'):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
-def append_dims(x, target_dims):
+def append_dims(x: th.Tensor, target_dims) -> th.Tensor:
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
     dims_to_append = target_dims - x.ndim
     if dims_to_append < 0:

@@ -11,6 +11,10 @@ import numpy as np
 import torch as th
 import torch.distributed as dist
 
+import pickle
+import glob
+import scipy
+
 from cm import dist_util, logger
 from cm.script_util import (
     train_defaults,
@@ -124,6 +128,7 @@ def main():
     itr = 0
     eval_num_samples = 0
     while itr * args.batch_size < args.eval_num_samples:
+        # org
         x_T = generator.randn(
             *(args.batch_size, args.in_channels, args.image_size, args.image_size),
             device=dist_util.dev()) * args.sigma_max
@@ -149,6 +154,8 @@ def main():
             model_kwargs["y"] = classes
             if args.large_log:
                 print("classes: ", model_kwargs)
+        
+        model_kwargs['x_T'] = x_T
         with th.no_grad():
             x = karras_sample(
                 diffusion=diffusion,
@@ -180,6 +187,10 @@ def main():
                 edm_style=args.edm_style,
                 target_snr=args.target_snr,
                 langevin_steps=args.langevin_steps,
+                churn_step_ratio=args.churn_step_ratio,
+                # guidance=0.5,
+                guidance=1.0,
+                # sigma_T=args.sigma_max,
             )
             #print(x[0])
 
@@ -188,7 +199,7 @@ def main():
         sample = sample.contiguous()
 
         if dist.get_rank() == 0:
-            sample = sample.cpu().detach()
+            sample = sample.detach().cpu()
             if args.large_log:
                 print(f"{(itr-1) * args.batch_size} sampling complete...")
             r = np.random.randint(1000000)
@@ -196,9 +207,9 @@ def main():
                 if args.class_cond:
                     if args.classifier_guidance:
                         np.savez(os.path.join(out_dir, f"sample_{r}.npz"), sample.numpy(),
-                                 classes.cpu().detach().numpy())
+                                 classes.detach().cpu().numpy())
                     else:
-                        np.savez(os.path.join(out_dir, f"sample_{r}.npz"), sample.numpy(), classes.cpu().detach().numpy())
+                        np.savez(os.path.join(out_dir, f"sample_{r}.npz"), sample.numpy(), classes.detach().cpu().numpy())
                 else:
                     np.savez(os.path.join(out_dir, f"sample_{r}.npz"), sample.numpy())
             if args.save_format == 'png' or itr == 0:
@@ -219,7 +230,106 @@ def main():
 
     dist.barrier()
     logger.log("sampling complete")
+    
+    mu, sigma = calculate_inception_stats(data_name=args.data_name, image_path=out_dir, num_samples=args.eval_num_samples, device=dist_util.dev(), ref_path=args.ref_path)
+    
 
+def calculate_inception_stats(data_name, image_path, num_samples=50000, batch_size=100, device=th.device('cuda'), ref_path=''):
+    import dnnlib
+    detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
+    detector_kwargs = dict(return_features=True)
+    with dnnlib.util.open_url(detector_url, verbose=(0 == 0)) as f:
+        detector_net = pickle.load(f).to(dist_util.dev())
+    with dnnlib.util.open_url(ref_path) as f:
+        ref = dict(np.load(f))
+        mu_ref = ref['mu']
+        sigma_ref = ref['sigma']
+        
+    def compute_fid(mu, sigma, ref_mu=None, ref_sigma=None, mu_ref=None, sigma_ref=None):
+        if np.array(ref_mu == None).sum():
+            ref_mu = mu_ref
+            assert ref_sigma == None
+            ref_sigma = sigma_ref
+        m = np.square(mu - ref_mu).sum()
+        s, _ = scipy.linalg.sqrtm(np.dot(sigma, ref_sigma), disp=False)
+        fid = m + np.trace(sigma + ref_sigma - s * 2)
+        fid = float(np.real(fid))
+        return fid
+    
+    if data_name.lower() == 'cifar10':
+        print(f'Loading images from "{image_path}"...')
+        feature_dim = 2048
+        mu = th.zeros([feature_dim], dtype=th.float64, device=device)
+        sigma = th.zeros([feature_dim, feature_dim], dtype=th.float64, device=device)
+        files = glob.glob(os.path.join(image_path, 'sample*.npz'))
+        count = 0
+        for file in files:
+            images = np.load(file)['arr_0']  # [0]#["samples"]
+            for k in range((images.shape[0] - 1) // batch_size + 1):
+                mic_img = images[k * batch_size: (k + 1) * batch_size]
+                mic_img = th.tensor(mic_img).permute(0, 3, 1, 2).to(device)
+                features = detector_net(mic_img, **detector_kwargs).to(th.float64)
+                if count + mic_img.shape[0] > num_samples:
+                    remaining_num_samples = num_samples - count
+                else:
+                    remaining_num_samples = mic_img.shape[0]
+                mu += features[:remaining_num_samples].sum(0)
+                sigma += features[:remaining_num_samples].T @ features[:remaining_num_samples]
+                count = count + remaining_num_samples
+                if count % 100000 == 0:
+                    print('(inception) count:', count)
+                if count >= num_samples:
+                    break
+            if count >= num_samples:
+                break
+        assert count == num_samples
+        # if count % 10000:
+        #     print('(inception) count:', count)
+        mu /= num_samples
+        sigma -= mu.ger(mu) * num_samples
+        sigma /= num_samples - 1
+        mu = mu.cpu().numpy()
+        sigma = sigma.cpu().numpy()
+        
+        logger.log(f"FID: {compute_fid(mu, sigma, mu_ref, sigma_ref)}")
+        return mu, sigma
+    else:
+        filenames = glob.glob(os.path.join(image_path, '*.npz'))
+        imgs = []
+        for file in filenames:
+            try:
+                img = np.load(file)  # ['arr_0']
+                try:
+                    img = img['data']
+                except:
+                    img = img['arr_0']
+                imgs.append(img)
+            except:
+                pass
+        imgs = np.concatenate(imgs, axis=0)
+        os.makedirs(os.path.join(image_path, 'single_npz'), exist_ok=True)
+        np.savez(os.path.join(os.path.join(image_path, 'single_npz'), f'data'),
+                    imgs)  # , labels)
+        logger.log("computing sample batch activations...")
+        from cm.evaluator import Evaluator
+        import tensorflow.compat.v1 as tf
+        config = tf.ConfigProto(
+            allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+        )
+        config.gpu_options.allow_growth = True
+        config.gpu_options.per_process_gpu_memory_fraction = 0.1
+        evaluator = Evaluator(tf.Session(config=config), batch_size=100)
+        sample_acts = evaluator.read_activations(
+            os.path.join(os.path.join(image_path, 'single_npz'), f'data.npz'))
+        logger.log("computing/reading sample batch statistics...")
+        sample_stats, sample_stats_spatial = tuple(evaluator.compute_statistics(x) for x in sample_acts)
+        with open(os.path.join(os.path.join(image_path, 'single_npz'), f'stats'), 'wb') as f:
+            pickle.dump({'stats': sample_stats, 'stats_spatial': sample_stats_spatial}, f)
+        with open(os.path.join(os.path.join(image_path, 'single_npz'), f'acts'), 'wb') as f:
+            pickle.dump({'acts': sample_acts[0], 'acts_spatial': sample_acts[1]}, f)
+            
+        return sample_acts, sample_stats, sample_stats_spatial
+        
 def create_argparser():
 
     defaults = dict(
@@ -235,8 +345,8 @@ def create_argparser():
         eval_seed=42,
         save_format='png',
         stochastic_seed=False,
-        #data_name='cifar10',
-        data_name='imagenet64',
+        data_name='cifar10',
+        # data_name='imagenet64',
         #schedule_sampler="lognormal",
         ind_1=0,
         ind_2=0,
@@ -250,9 +360,9 @@ def create_argparser():
         langevin_steps=1,
     )
     defaults.update(train_defaults(defaults['data_name']))
-    defaults.update(model_and_diffusion_defaults(defaults['data_name']))
-    defaults.update(cm_train_defaults(defaults['data_name']))
     defaults.update(ctm_train_defaults(defaults['data_name']))
+    defaults.update(model_and_diffusion_defaults(defaults['data_name'], defaults['is_I2I']))
+    defaults.update(cm_train_defaults(defaults['data_name']))
     defaults.update(ctm_eval_defaults(defaults['data_name']))
     defaults.update(ctm_loss_defaults(defaults['data_name']))
     defaults.update(ctm_data_defaults(defaults['data_name']))

@@ -15,9 +15,12 @@ import torch.nn.functional as F
 
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
+from .bf16_util import MixedPrecisionTrainer_bf16
 from .nn import update_ema
-from .resample import LossAwareSampler, UniformSampler
+# from .resample import LossAwareSampler, UniformSampler
+from .resample import UniformSampler
 import nvidia_smi
+from .nn import mean_flat, append_dims
 
 from .fp16_util import (
     get_param_groups_and_shapes,
@@ -25,6 +28,13 @@ from .fp16_util import (
     make_master_params,
     state_dict_to_master_params,
     master_params_to_model_params,
+)
+from .bf16_util import (
+    get_param_groups_and_shapes_bf16,
+    get_target_param_groups_and_shapes_bf16,
+    make_master_params_bf16,
+    state_dict_to_master_params_bf16,
+    master_params_to_model_params_bf16,
 )
 import numpy as np
 from cm.sample_util import karras_sample
@@ -52,14 +62,17 @@ class TrainLoop:
         data,
         batch_size,
         args=None,
+        augment=None,
+        test_data=None,
+        perform_test=False,
     ):
         self.args = args
         self.model = model
-        if self.args.sanity_check:
-            for name, param in self.model.named_parameters():
-                logger.log("check and understand how consistency-type models override model parameters")
-                logger.log("model parameter before overriding: ", param.data.cpu().detach().reshape(-1)[:3])
-                break
+        # if self.args.sanity_check:
+        #     for name, param in self.model.named_parameters():
+        #         logger.log("check and understand how consistency-type models override model parameters")
+        #         logger.log("model parameter before overriding: ", param.data.detach().cpu().reshape(-1)[:3])
+        #         break
         self.discriminator = discriminator
         self.diffusion = diffusion
         self.data = data
@@ -76,6 +89,7 @@ class TrainLoop:
         self.global_batch = self.batch_size * dist.get_world_size()
         self.fids = []
         self.generator = get_generator('determ', self.args.eval_num_samples, self.args.eval_seed)
+        # org:
         self.x_T = self.generator.randn(*(self.args.sampling_batch, self.args.in_channels, self.args.image_size, self.args.image_size),
                                         device='cpu') * self.args.sigma_max #.to(dist_util.dev())
         if self.args.class_cond:
@@ -87,39 +101,62 @@ class TrainLoop:
         self._load_and_sync_parameters()
         if self.args.sanity_check:
             for name, param in self.model.named_parameters():
-                logger.log("model parameter after overriding: ", param.data.cpu().detach().reshape(-1)[:3])
+                logger.log('sanity check @', name)
+                logger.log("model parameter after overriding: ", param.data.detach().cpu().reshape(-1)[:3])
                 break
         if self.discriminator != None:
             if self.args.sanity_check:
                 for name, param in self.discriminator.named_parameters():
-                    logger.log("discriminator parameter before overriding: ", param.data.cpu().detach().reshape(-1)[:3])
+                    logger.log("discriminator parameter before overriding: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
             self._load_and_sync_discriminator_parameters()
             if self.args.sanity_check:
                 for name, param in self.discriminator.named_parameters():
-                    logger.log("discriminator parameter after overriding: ", param.data.cpu().detach().reshape(-1)[:3])
+                    logger.log("discriminator parameter after overriding: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
-
-        self.mp_trainer = MixedPrecisionTrainer(
-            model=self.model,
-            use_fp16=args.use_fp16,
-            fp16_scale_growth=args.fp16_scale_growth,
-        )
+        
+        if args.use_bf16:
+            assert not args.use_fp16
+            self.mp_trainer = MixedPrecisionTrainer_bf16(
+                model=self.model,
+                use_bf16=args.use_bf16,
+                bf16_scale_growth=args.bf16_scale_growth,
+            )
+        else:
+            self.mp_trainer = MixedPrecisionTrainer(
+                model=self.model,
+                use_fp16=args.use_fp16,
+                fp16_scale_growth=args.fp16_scale_growth,
+            )
+        
         if self.args.sanity_check:
             logger.log("mp trainer master parameter (should same to the model parameter if no linear_probing): ", self.mp_trainer.master_params[1].reshape(-1)[:3])
-
         self.opt = RAdam(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.args.weight_decay
         )
+        
         if self.args.sanity_check:
             print("opt state dict before overriding: ", self.opt.state_dict())
-
         if self.discriminator != None:
-            self.d_mp_trainer = MixedPrecisionTrainer(
+            # self.d_mp_trainer = MixedPrecisionTrainer(
+            #     model=self.discriminator,
+            #     use_fp16=args.use_d_fp16,
+            #     fp16_scale_growth=args.fp16_scale_growth,
+            # )
+            
+            if args.use_bf16:
+                self.d_mp_trainer = MixedPrecisionTrainer_bf16(
+                    model=self.discriminator,
+                    use_bf16=args.use_bf16,
+                    bf16_scale_growth=args.bf16_scale_growth,
+                )
+            else:
+                self.d_mp_trainer = MixedPrecisionTrainer(
                 model=self.discriminator,
                 use_fp16=args.use_d_fp16,
                 fp16_scale_growth=args.fp16_scale_growth,
             )
+            
             self.d_opt = RAdam(
                 self.d_mp_trainer.master_params, lr=args.d_lr, weight_decay=self.args.weight_decay, betas=(0.5, 0.9)
             )
@@ -147,6 +184,7 @@ class TrainLoop:
 
         if th.cuda.is_available():
             self.use_ddp = True
+            
             self.ddp_model = DDP(
                 self.model,
                 device_ids=[dist_util.dev()],
@@ -175,7 +213,13 @@ class TrainLoop:
             self.ddp_model = self.model
 
         self.step = self.resume_step
-
+        self.augment = augment
+        
+        if perform_test:
+            assert test_data is not None
+        self.test_data = test_data
+        self.perform_test = perform_test
+        
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.args.resume_checkpoint
 
@@ -189,7 +233,8 @@ class TrainLoop:
                     state_dict = dist_util.load_state_dict(
                         resume_checkpoint, map_location='cpu',  # dist_util.dev()
                     )
-                self.model.load_state_dict(state_dict, strict=False)
+                # self.model.load_state_dict(state_dict, strict=False)
+                self.model.load_state_dict(state_dict, strict=True)
                 logger.log(f"end loading pretrained model from checkpoint: {resume_checkpoint}...")
 
         dist_util.sync_params(self.model.parameters())
@@ -280,8 +325,9 @@ class TrainLoop:
             logger.log(f"end loading d_optimizer state from checkpoint: {opt_checkpoint}")
 
     def _update_ema(self):
+        assert len(self.ema_rate) == 1 and self.ema_rate[0] == 0.99993, "According to iCT, ema of model = 0.99993." # 19th aug
         for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.mp_trainer.master_params, rate=rate)
+            update_ema(target_params=params, source_params=self.mp_trainer.master_params, rate=rate)
 
     def _anneal_lr(self):
         if not self.args.lr_anneal_steps:
@@ -306,7 +352,7 @@ class TrainLoop:
 
         number = 0
         while num_samples > number:
-            print(f"{number} number samples complete")
+            # print(f"{number} number samples complete")
             with th.no_grad():
                 model_kwargs = {}
                 if self.args.class_cond:
@@ -326,14 +372,29 @@ class TrainLoop:
                                 model_kwargs["y"] = self.classes.to(dist_util.dev())
                             else:
                                 model_kwargs["y"] = th.randint(0, self.args.num_classes, size=(batch_size, ), device=dist_util.dev())
+                assert generator is None, "Seems to be None." # 20th Aug
                 if generator != None:
+                    # org:
                     x_T = generator.randn(*(batch_size, self.args.in_channels, self.args.image_size, self.args.image_size),
                                 device=dist_util.dev()) * self.args.sigma_max
                     if self.args.large_log:
                         print("x_T: ", x_T[0][0][0][:3])
                 else:
+                    # x_T = self.x_T.clone().to(dist_util.dev())
                     x_T = None
-
+                
+                model_kwargs['x_T'] = x_T if generator != None else self.x_T.to(dist_util.dev()) if num_samples == -1 else None
+                
+                # print("model_kwargs['x_T']:", model_kwargs['x_T'])
+                # assert model_kwargs['x_T'] is not None
+                # exit()
+                # if sampler == 'hybrid':
+                #     assert model_kwargs['x_T'] is not None
+                
+                # model_kwargs['x_T'] = x_T
+                if not self.is_I2I:
+                    assert self.args.churn_step_ratio == 0
+                    
                 sample = karras_sample(
                     diffusion=self.diffusion,
                     model=model,
@@ -346,11 +407,16 @@ class TrainLoop:
                     generator=None,
                     teacher=teacher,
                     ctm=ctm if ctm != None else True if self.args.training_mode.lower() == 'ctm' else False,
-                    x_T=x_T if generator != None else self.x_T.to(dist_util.dev()) if num_samples == -1 else None,
+                    # x_T=x_T if generator != None else self.x_T.to(dist_util.dev()) if num_samples == -1 else None,
+                    x_T=model_kwargs['x_T'],
                     clip_output=self.args.clip_output,
                     sigma_min=self.args.sigma_min,
                     sigma_max=self.args.sigma_max,
                     train=False,
+                    churn_step_ratio=self.args.churn_step_ratio,
+                    guidance=self.args.guidance_scale,
+                    gamma=self.args.gamma,
+                    # use_milstein_method=self.args.use_milstein_method,
                 )
                 if resize:
                     sample = F.interpolate(sample, size=224, mode="bilinear")
@@ -416,13 +482,13 @@ class TrainLoop:
                 psnr += cv2.PSNR(img, ref_img) * remaining_num_samples
                 ssim += SSIM_(img,ref_img,multichannel=True,channel_axis=3,data_range=255) * remaining_num_samples
                 count = count + remaining_num_samples
-                print(count)
+                # print('(sim) count:', count)
                 if count >= num_samples:
                     break
             if count >= num_samples:
                 break
         assert count == num_samples
-        print(count)
+        # print('(sim) count:', count)
         psnr /= num_samples
         ssim /= num_samples
         assert num_samples % 1000 == 0
@@ -451,13 +517,15 @@ class TrainLoop:
                     mu += features[:remaining_num_samples].sum(0)
                     sigma += features[:remaining_num_samples].T @ features[:remaining_num_samples]
                     count = count + remaining_num_samples
-                    print(count)
+                    if count % 100000 == 0:
+                        print('(inception) count:', count)
                     if count >= num_samples:
                         break
                 if count >= num_samples:
                     break
             assert count == num_samples
-            print(count)
+            # if count % 10000:
+            #     print('(inception) count:', count)
             mu /= num_samples
             sigma -= mu.ger(mu) * num_samples
             sigma /= num_samples - 1
@@ -524,11 +592,11 @@ class TrainLoop:
                 mu += features[:remaining_num_samples].sum(0)
                 sigma += features[:remaining_num_samples].T @ features[:remaining_num_samples]
                 count = count + remaining_num_samples
-                logger.log(count)
+                # logger.log(f'(inception npz) count: {count}')
             if count >= num_samples:
                 break
         assert count == num_samples
-        print(count)
+        # print('(inception npz) count:', count)
         mu /= num_samples
         sigma -= mu.ger(mu) * num_samples
         sigma /= num_samples - 1
@@ -549,6 +617,7 @@ class CMTrainLoop(TrainLoop):
         target_model,
         teacher_model,
         ema_scale_fn,
+        is_I2I: bool,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -556,17 +625,28 @@ class CMTrainLoop(TrainLoop):
         self.ema_scale_fn = ema_scale_fn
         self.target_model = target_model
         self.teacher_model = teacher_model
+        assert teacher_model is None
+        self.old_scales = self.args.start_scales + 1
         self.total_training_steps = self.args.total_training_steps
-
+        self.is_I2I = is_I2I
+        # if not is_I2I:
+        #     self.x_T = self.generator.randn(*(self.args.sampling_batch, self.args.in_channels, self.args.image_size, self.args.image_size),
+        #                                 device='cpu') * self.args.sigma_max #.to(dist_util.dev())
+        #     # self.x_T = th.randn(*(self.args.sampling_batch, self.args.in_channels, self.args.image_size, self.args.image_size),
+        #     #                     device='cpu') * self.args.sigma_max
+        # else:
+        #     self.x_T = None
+        #     raise NotImplementedError('I2I not implemented yet for cifar10.')
+            
         if target_model:
             if self.args.sanity_check:
                 for name, param in self.target_model.named_parameters():
-                    logger.log("target model parameter before overriding: ", param.data.cpu().detach().reshape(-1)[:3])
+                    logger.log("target model parameter before overriding: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
             self._load_and_sync_ema_parameters_to_target_parameters()
             if self.args.sanity_check:
                 for name, param in self.target_model.named_parameters():
-                    logger.log("target model parameter after overriding: ", param.data.cpu().detach().reshape(-1)[:3])
+                    logger.log("target model parameter after overriding: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
             self.target_model.requires_grad_(False)
             self.target_model.train()
@@ -576,6 +656,13 @@ class CMTrainLoop(TrainLoop):
                     self.target_model.named_parameters(), self.model.named_parameters()
                 )
                 self.target_model_master_params = make_master_params(
+                    self.target_model_param_groups_and_shapes
+                )
+            elif self.args.use_bf16:
+                self.target_model_param_groups_and_shapes = get_target_param_groups_and_shapes_bf16(
+                    self.target_model.named_parameters(), self.model.named_parameters()
+                )
+                self.target_model_master_params = make_master_params_bf16(
                     self.target_model_param_groups_and_shapes
                 )
             else:
@@ -594,9 +681,14 @@ class CMTrainLoop(TrainLoop):
                             self.target_model_param_groups_and_shapes,
                             self.target_model_master_params,
                         )
+                    elif self.args.use_bf16:
+                        master_params_to_model_params_bf16(
+                            self.target_model_param_groups_and_shapes,
+                            self.target_model_master_params,
+                        )
             if self.args.sanity_check:
                 for name, param in self.target_model.named_parameters():
-                    logger.log("target model parameter after all: ", param.data.cpu().detach().reshape(-1)[:3])
+                    logger.log("target model parameter after all: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
 
         if teacher_model:
@@ -609,12 +701,26 @@ class CMTrainLoop(TrainLoop):
         self.initial_step = copy.deepcopy(self.step)
         if self.args.gpu_usage:
             nvidia_smi.nvmlInit()
-            self.deviceCount = nvidia_smi.nvmlDeviceGetCount()
+            # self.deviceCount = nvidia_smi.nvmlDeviceGetCount()
+            self.deviceCount = []
+            for idx in self.args.device_id.split(','):
+                if idx != '':
+                    self.deviceCount.append(int(idx))
+                    
             self.print_gpu_usage('Before everything')
 
         if self.args.check_dm_performance:
+            
             if not os.path.exists(self.args.dm_sample_path_seed_42):
-                self.sampling(model=self.teacher_model, sampler='heun', teacher=True, step=18 if self.args.data_name.lower() == 'cifar10' else 40,
+                # _sampler = 'heun' # ORG
+                if self.args.eval_sampler == 'hybrid':
+                    _sampler = 'hybrid'
+                
+                    print("Using hybrid solver (in init of CMTrainLoop) for sampling...")
+                else:
+                    _sampler = 'heun'
+                
+                self.sampling(model=self.teacher_model, sampler=_sampler, teacher=True, step=18 if self.args.data_name.lower() == 'cifar10' else 40,
                               num_samples=self.args.eval_num_samples, batch_size=self.args.eval_batch,
                               rate=0.0, ctm=False, png=False, resize=False,
                               generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
@@ -665,9 +771,20 @@ class CMTrainLoop(TrainLoop):
                 config.gpu_options.allow_growth = True
                 config.gpu_options.per_process_gpu_memory_fraction = 0.1
                 self.evaluator = Evaluator(tf.Session(config=config), batch_size=100)
-
-                self.ref_acts = self.evaluator.read_activations(self.args.ref_path)
+                ref_path: str = self.args.ref_path
+                parent_of_ref_path = '/'.join( ref_path.split('/')[:-1] )
+                saved_filepath = f"{parent_of_ref_path}/{self.args.data_name}_activations.npz"
+                
+                if os.path.exists(saved_filepath):
+                    acts = np.load(saved_filepath)
+                    self.ref_acts = acts['preds'], acts['spatial_preds']
+                else:
+                    self.ref_acts = self.evaluator.read_activations(self.args.ref_path)
+                    np.savez(saved_filepath, preds=self.ref_acts[0], spatial_preds=self.ref_acts[1])
+                    print("Done saving activations!")
+                
                 self.ref_stats, self.ref_stats_spatial = self.evaluator.read_statistics(self.args.ref_path, self.ref_acts)
+                
                 if self.args.check_dm_performance:
                     if os.path.exists(os.path.join(os.path.join(self.args.dm_sample_path_seed_42, 'single_npz'), f'stats')):
                         with open(os.path.join(os.path.join(self.args.dm_sample_path_seed_42, 'single_npz'), f'acts'), 'rb') as f:
@@ -760,15 +877,50 @@ class CMTrainLoop(TrainLoop):
         dist_util.sync_params(self.teacher_model.parameters())
         dist_util.sync_params(self.teacher_model.buffers())
 
+    def preprocess(self, x):
+        if x.shape[1] == 3:
+            x =  x * 2 - 1
+    
+        return x
+    
     def run_loop(self):
+            
         if self.args.gpu_usage:
             self.print_gpu_usage('Before training')
         saved = False
         while (
-            self.step < self.args.lr_anneal_steps
-            or self.global_step < self.total_training_steps
+            self.step < self.args.lr_anneal_steps or
+            self.global_step < self.total_training_steps
         ):
-            batch, cond = next(self.data)
+            # print(f'global_step: {self.global_step} | total_training_steps: {self.total_training_steps}')
+            if self.args.data_name.startswith('edges2') or self.args.data_name.startswith('diode'):
+                # batch, cond, _ = next(self.data)
+                idx_i, (batch, cond, _) = next(enumerate(self.data))
+                batch = self.preprocess(batch)
+                
+                if self.augment is not None:
+                    batch, _ = self.augment(batch)
+
+                if isinstance(cond, th.Tensor) and batch.ndim == cond.ndim:
+                    x_T = self.preprocess(cond)
+                    cond = {'x_T': x_T}
+                else:
+                    cond['x_T'] = self.preprocess(cond['x_T'])
+            else:
+                assert not self.is_I2I
+                
+                # Preprocessed data that is normalized to [-1, 1] already:
+                batch, cond = next(self.data)
+                # print('batch', batch[0].shape)
+                # print('here! norm:', th.min(batch), th.max(batch))
+                # exit()
+
+                # cond['x_T'] = batch + append_dims(th.ones_like(batch)*self.args.sigma_data_end, batch.ndim) * th.randn_like(batch) # <- commented out on 6/25
+                cond['x_T'] = batch + append_dims(th.ones_like(batch)*self.args.sigma_max, batch.ndim) * th.randn_like(batch) # <- made this on 6/25
+                # cond['x_T'] = batch + self.args.sigma_data_end * self.generator.randn_like(batch) # < made to be the same as self.x_T
+                                
+            # cond['x_T'] = cond['x_T'].detach().clone()
+                
             if self.args.large_log:
                 print("batch size: ", batch.shape)
                 print("rank: ", dist.get_rank())
@@ -786,19 +938,22 @@ class CMTrainLoop(TrainLoop):
                             self.sampling(model=self.ddp_model, sampler='onestep', step=1)
                     if self.step == self.initial_step + 10 and self.teacher_model != None:
                         self.sampling(model=self.teacher_model, sampler='heun', ctm=False, teacher=True)
-            self.run_step(batch, cond)
+            
+            self.run_step(batch, cond) 
+            
             if self.args.gpu_usage:
                 self.print_gpu_usage('After one step training')
             if self.args.large_log:
                 print("mp trainer master parameter after one step update: ", self.mp_trainer.master_params[1].reshape(-1)[:3])
                 for name, param in self.model.named_parameters():
-                    print("model parameter after one step update: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("model parameter after one step update: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
                 for name, param in self.target_model.named_parameters():
-                    print("target model parameter after one step update: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("target model parameter after one step update: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
             if self.args.check_ctm_denoising_ability:
                 self.eval(step=18, sampler='heun', teacher=True, ctm=True, rate=0.0)
+            
             if (
                 self.global_step
                 and self.args.eval_interval != -1
@@ -820,17 +975,21 @@ class CMTrainLoop(TrainLoop):
                               class_generator=get_generator('determ', self.args.eval_num_samples, 0),
                               delete=True)
                 self.evaluation(0.0)
-                logger.log('Evaluation with model parameter end')
+                logger.log('Evaluation with model parameter ended.')
                 for rate, params in zip(self.ema_rate, self.ema_params):
+                    # if rate == 0.99993:
+                    #     state_dict = None
+                    #     continue
                     if not self.args.compute_ema_fids:
                         if rate != 0.999:
                             continue
                     state_dict = self.mp_trainer.master_params_to_state_dict(params)
                     self.model.load_state_dict(state_dict, strict=False)
-                    self.evaluation(rate)
-                    logger.log(f'Evaluation with {rate}-EMA model parameter end')
+                    self.evaluation(rate) # don't evaluate with ema model.
+                    logger.log(f'Evaluation with {rate}-EMA model parameter ended.')
                 self.model.load_state_dict(model_state_dict, strict=True)
                 del model_state_dict, state_dict
+                
                 if self.args.gpu_usage:
                     self.print_gpu_usage('Before emptying cache in evaluation 2')
                 gc.collect()
@@ -846,6 +1005,7 @@ class CMTrainLoop(TrainLoop):
                     or self.step == self.args.lr_anneal_steps - 1
                     or self.global_step == self.total_training_steps - 1
             ):
+                
                 gc.collect()
                 th.cuda.empty_cache()
                 model_state_dict = self.model.state_dict()
@@ -870,18 +1030,19 @@ class CMTrainLoop(TrainLoop):
                 print("mp trainer master parameter after sampling: ",
                       self.mp_trainer.master_params[1].reshape(-1)[:3])
                 for name, param in self.model.named_parameters():
-                    print("model parameter after sampling: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("model parameter after sampling: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
                 for name, param in self.target_model.named_parameters():
-                    print("target model parameter after sampling: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("target model parameter after sampling: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
-
+                
             saved = False
             if (
                 self.global_step
                 and self.args.save_interval != -1
                 and self.global_step % self.args.save_interval == 0
             ):
+                
                 self.save()
                 if self.discriminator != None:
                     self.d_save()
@@ -891,17 +1052,37 @@ class CMTrainLoop(TrainLoop):
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
+                
+                if self.perform_test:
+                    if self.args.data_name.startswith('edges2') or self.args.data_name.startswith('diode'):
+                        if self.test_data is not None: 
+                            print(f"Need to pass test dataset if e2h, e2s, or diode datasets!")
+                            raise ValueError("Pass testset since dataset is e2h/e2s/diode.")
+                        
+                        test_batch, test_cond, _ = next(iter(self.test_data))
+                        test_batch = self.preprocess(test_batch)
+                        if isinstance(test_cond, th.Tensor) and test_batch.ndim == test_cond.ndim:
+                            test_cond = {'x_T': self.preprocess(test_cond)}
+                        else:
+                            test_cond['x_T'] = self.preprocess(test_cond['x_T'])
+                        
+                        with th.no_grad():
+                            self.forward_backward(test_batch, test_cond, is_train=False)
+                            # self.run_test_step(test_batch, test_cond)
+                        logger.dumpkvs()
+                
             if self.global_step % self.args.log_interval == 0:
                 logger.dumpkvs()
-                logger.log(datetime.datetime.now().strftime("SONY-%Y-%m-%d-%H-%M-%S"))
+                logger.log(datetime.datetime.now().strftime("(SONY) Date %Y-%m-%d Time %H-%M-%S"))
+                
             if self.args.large_log:
                 print("mp trainer master parameter after saving: ",
                       self.mp_trainer.master_params[1].reshape(-1)[:3])
                 for name, param in self.model.named_parameters():
-                    print("model parameter after saving: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("model parameter after saving: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
                 for name, param in self.target_model.named_parameters():
-                    print("target model parameter after saving: ", param.data.cpu().detach().reshape(-1)[:3])
+                    print("target model parameter after saving: ", param.data.detach().cpu().reshape(-1)[:3])
                     break
                 print(f"0.999 ema param after overriding (should be same to the target parameter): ",
                       self.ema_params[0][1].reshape(-1)[:3])
@@ -923,34 +1104,48 @@ class CMTrainLoop(TrainLoop):
 
     def evaluation(self, rate):
         if self.args.training_mode.lower() == 'ctm':
+            
+            sampler = self.args.eval_sampler
+            assert sampler in ['hybrid', 'heun', 'exact', 'exact_hybrid', 'gamma_from_toy', 
+                               'contri_sampler', 'contri_sampler2', 'bridge_gamma_multistep', 
+                               'contri_ddpm_pp', 'contri_ddpm_pp_cm']
+            
             if self.args.eval_fid:
-                self.eval(step=1, rate=rate, ctm=True, delete=True)
+                logger.log("Evaluating FID for # ODE Steps = 1...")
+                self.eval(step=1, rate=rate, ctm=True, delete=True, sampler=sampler)
             if self.args.eval_similarity:
                 self.eval(step=1, rate=rate, ctm=True, generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
                                   class_generator=get_generator('determ', self.args.eval_num_samples, 0),
-                          metric='similarity', delete=True)
-            if self.args.eval_fid:
-                self.eval(step=2, rate=rate, ctm=True, delete=True)
-            if self.args.eval_similarity:
-                self.eval(step=2, rate=rate, ctm=True,
-                          generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
-                          class_generator=get_generator('determ', self.args.eval_num_samples, 0),
-                          metric='similarity', delete=True)
-            if self.args.compute_ema_fids:
-                if self.args.eval_fid:
-                    self.eval(step=4, rate=rate, ctm=True, delete=True)
-                if self.args.eval_similarity:
-                    self.eval(step=4, rate=rate, ctm=True, generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
-                              class_generator=get_generator('determ', self.args.eval_num_samples, 0),
-                              metric='similarity', delete=True)
+                          metric='similarity', delete=True, sampler=sampler)
+            
+            # if rate == 0.:
+            #     if self.args.eval_fid:
+            #         logger.log("Evaluating FID for # ODE Steps = 2...")
+            #         self.eval(step=2, rate=rate, ctm=True, delete=True, sampler=sampler)
+            #     if self.args.eval_similarity:
+            #         self.eval(step=2, rate=rate, ctm=True,
+            #                 generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
+            #                 class_generator=get_generator('determ', self.args.eval_num_samples, 0),
+            #                 metric='similarity', delete=True, sampler=sampler)
+                
+            # if self.args.compute_ema_fids:
+            #     logger.log("Evaluating FID for # ODE Steps = 4...")
+            #     if self.args.eval_fid:
+            #         self.eval(step=4, rate=rate, ctm=True, delete=True, sampler=sampler)
+            #     if self.args.eval_similarity:
+            #         self.eval(step=4, rate=rate, ctm=True, generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
+            #                   class_generator=get_generator('determ', self.args.eval_num_samples, 0),
+            #                   metric='similarity', delete=True, sampler=sampler)
+                    
             if self.args.large_nfe_eval:
                 step = 18 if self.args.data_name.lower() == 'cifar10' else 40
                 if self.args.eval_fid:
-                    self.eval(step=step, rate=rate, ctm=True, delete=True)
+                    logger.log("Evaluating FID for # ODE Steps = 18...")
+                    self.eval(step=step, rate=rate, ctm=True, delete=True, sampler=sampler)
                 if self.args.eval_similarity:
                     self.eval(step=step, rate=rate, ctm=True, generator=get_generator('determ', self.args.eval_num_samples, self.args.eval_seed),
                               class_generator=get_generator('determ', self.args.eval_num_samples, 0),
-                              metric='similarity', delete=True)
+                              metric='similarity', delete=True, sampler=sampler)
 
         elif self.args.training_mode.lower() == 'cm':
             if self.args.eval_fid:
@@ -960,13 +1155,17 @@ class CMTrainLoop(TrainLoop):
         if self.args.large_log:
             print("mp trainer master parameter before update: ", self.mp_trainer.master_params[1].reshape(-1)[:3])
             for name, param in self.model.named_parameters():
-                print("model parameter before update: ", param.data.cpu().detach().reshape(-1)[:3])
+                print("model parameter before update: ", param.data.detach().cpu().reshape(-1)[:3])
                 break
-            for name, param in self.target_model.named_parameters():
-                print("target model parameter before update: ", param.data.cpu().detach().reshape(-1)[:3])
-                break
+            if self.target_model:
+                for name, param in self.target_model.named_parameters():
+                    print("target model parameter before update: ", param.data.detach().cpu().reshape(-1)[:3])
+                    break
+            
         self.forward_backward(batch, cond)
+        
         if self.discriminator == None:
+            # print('discriminator == None here')
             took_step = self.mp_trainer.optimize(self.opt)
             if took_step:
                 self._update_ema()
@@ -974,11 +1173,13 @@ class CMTrainLoop(TrainLoop):
                     self._update_target_ema()
                 self.step += 1
                 self.global_step += 1
+            # exit()
         else:
             if self.step % self.args.g_learning_period == 0:
                 took_step = self.mp_trainer.optimize(self.opt)
             else:
                 took_step = self.d_mp_trainer.optimize(self.d_opt)
+            
             # print(self.step, took_step)
             if took_step:
                 if self.step % self.args.g_learning_period == 0:
@@ -990,8 +1191,12 @@ class CMTrainLoop(TrainLoop):
         self._anneal_lr()
         self.log_step()
 
+    # def _update_ema(self):
+    #     for rate, params in zip(self.ema_rate, self.ema_params):
+    #         update_ema(params, self.mp_trainer.master_params, rate=rate)
     def _update_target_ema(self):
         target_ema, scales = self.ema_scale_fn(self.global_step)
+        assert target_ema == 0.0, "Target ema should be 0.0 acc. to iCT." # 19th Aug
         with th.no_grad():
             update_ema(
                 self.target_model_master_params,
@@ -1003,9 +1208,15 @@ class CMTrainLoop(TrainLoop):
                     self.target_model_param_groups_and_shapes,
                     self.target_model_master_params,
                 )
+            elif self.args.use_bf16:
+                master_params_to_model_params_bf16(
+                    self.target_model_param_groups_and_shapes,
+                    self.target_model_master_params,
+                )
 
-    def forward_backward(self, batch, cond):
-        self.mp_trainer.zero_grad()
+    def forward_backward(self, batch, cond, is_train=True):
+        if is_train:
+            self.mp_trainer.zero_grad()
         if self.discriminator != None:
             self.d_mp_trainer.zero_grad()
         num_heun_step = [self.diffusion.get_num_heun_step(num_heun_step=self.args.num_heun_step)]
@@ -1027,19 +1238,36 @@ class CMTrainLoop(TrainLoop):
         diffusion_training_ = diffusion_training_[0]
         gan_training_ = gan_training_[0]
 
+        target_ema, num_scales = self.ema_scale_fn(self.global_step)
+        if num_scales != self.old_scales :
+            logger.log(f"NOTE: Changed N from {self.old_scales} -> {num_scales} !")
+            self.old_scales = num_scales
+            
+        assert target_ema == 0., "According to iCT!"
+        
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
+                        
             last_batch = (i + self.microbatch) >= batch.shape[0]
+            # if self.args.scale_mode == 'ict_exp':
+            #     _target_model = self.model # According to iCT paper.
+            #     assert self.target_model is None and self.args.start_ema == 0.
+            # else:
+            #     _target_model = self.target_model
+                
+            # assert _target_model is not None, "Target Model cannot be None!"
             compute_losses = functools.partial(
-                self.diffusion.ctm_losses,
+                # self.diffusion.ctm_losses, 
+                self.diffusion.bridge_ctm_losses,
                 step=self.step,
                 model=self.ddp_model,
                 x_start=micro,
                 model_kwargs=micro_cond,
+                # target_model=_target_model,
                 target_model=self.target_model,
                 discriminator=self.ddp_discriminator,
                 init_step=self.initial_step,
@@ -1048,6 +1276,9 @@ class CMTrainLoop(TrainLoop):
                 gan_num_heun_step=gan_num_heun_step,
                 diffusion_training_=diffusion_training_,
                 gan_training_=gan_training_,
+                sigma_max=self.args.sigma_max,
+                current_timestep=self.global_step,
+                num_scales=num_scales,
             )
 
             if last_batch or not self.use_ddp:
@@ -1070,35 +1301,65 @@ class CMTrainLoop(TrainLoop):
                     loss = loss + self.args.discriminator_weight * losses['d_loss'].mean()
                 if 'denoising_loss' in list(losses.keys()):
                     loss = loss + self.args.denoising_weight * losses['denoising_loss'].mean()
-                log_loss_dict({k: v.view(-1) for k, v in losses.items()})
-                if self.args.sanity_check:
+                if 'bridge_denoising_loss' in list(losses.keys()):
+                    loss = loss + self.args.bridge_denoising_weight * losses['bridge_denoising_loss'].mean()
+                if 'q_part_loss' in list(losses.keys()):
+                    loss = loss + self.args.q_part_denoising_weight * losses['q_part_loss'].mean()
+                    
+                if is_train:
+                    log_loss_dict({k: v.view(-1) for k, v in losses.items()})
+                else:
+                    log_loss_dict({'test_'+k: v.view(-1) for k, v in losses.items()})
+                
+                if self.args.sanity_check and is_train:
                     print("rank: ", dist.get_rank())
                     for name, param in self.model.named_parameters():
                         print("model parameter gradient for current microbatch: ",
                               th.autograd.grad(outputs=(2**self.mp_trainer.lg_loss_scale) * loss, inputs=param, retain_graph=True)[0].reshape(-1)[:3])
                         break
-                self.mp_trainer.backward(loss)
+                
+                if is_train:
+                    self.mp_trainer.backward(loss)
 
             elif 'd_loss' in list(losses.keys()):
                 assert self.step % self.args.g_learning_period != 0
                 loss = (losses["d_loss"]).mean()
-                self.d_mp_trainer.backward(loss)
-                if self.args.large_log:
-                    for param in self.discriminator.parameters():
-                        try:
-                            print("discriminator param data, grad: ", param.grad.reshape(-1)[:3])
-                        except:
-                            print("discriminator param grad: ", param.grad)
-                        break
+                
+                if is_train:
+                    self.d_mp_trainer.backward(loss)
+                    if self.args.large_log:
+                        for param in self.discriminator.parameters():
+                            try:
+                                print("discriminator param data, grad: ", param.grad.reshape(-1)[:3])
+                            except:
+                                print("discriminator param grad: ", param.grad)
+                            break
 
             elif 'denoising_loss' in list(losses.keys()):
                 loss = losses['denoising_loss'].mean()
-                log_loss_dict({k: v.view(-1) for k, v in losses.items()})
-                self.mp_trainer.backward(loss)
-            if self.args.sanity_check:
+                if is_train:
+                    log_loss_dict({k: v.view(-1) for k, v in losses.items()})
+                    self.mp_trainer.backward(loss)
+                else:
+                    log_loss_dict({'test_'+k: v.view(-1) for k, v in losses.items()})
+            elif 'bridge_denoising_loss' in list(losses.keys()):
+                loss = losses['bridge_denoising_loss'].mean()
+                if is_train:
+                    log_loss_dict({k: v.view(-1) for k, v in losses.items()})
+                    self.mp_trainer.backward(loss)
+                else:
+                    log_loss_dict({'test_'+k: v.view(-1) for k, v in losses.items()})
+            elif 'q_part_loss' in list(losses.keys()):
+                loss = losses['q_part_loss'].mean()
+                if is_train:
+                    log_loss_dict({k: v.view(-1) for k, v in losses.items()})
+                    self.mp_trainer.backward(loss)
+                else:
+                    log_loss_dict({'test_'+k: v.view(-1) for k, v in losses.items()})
+            if self.args.sanity_check and is_train:
                 print("rank: ", dist.get_rank())
                 for name, param in self.model.named_parameters():
-                    print("model parameter gradient across all microbatch: ", param.grad.cpu().detach().reshape(-1)[:3])
+                    print("model parameter gradient across all microbatch: ", param.grad.detach().cpu().reshape(-1)[:3])
                     break
 
     @th.no_grad()
@@ -1121,17 +1382,25 @@ class CMTrainLoop(TrainLoop):
                                                                num_samples=self.args.eval_num_samples)
                     logger.log(f"{self.step}-th step {sampler} sampler (NFE {step}) EMA {rate}"
                                f" FID-{self.args.eval_num_samples // 1000}k: {self.compute_fid(mu, sigma)}")
+                    
                 if metric == 'similarity':
                     mu, sigma = self.calculate_inception_stats(self.args.data_name,
                                                                os.path.join(get_blob_logdir(), sample_dir),
                                                                num_samples=self.args.eval_num_samples)
                     logger.log(f"{self.step}-th step {sampler} sampler (NFE {step}) seed 42 EMA {rate}"
                                f" FID-{self.args.eval_num_samples // 1000}k: {self.compute_fid(mu, sigma)}")
+                    
                 if self.args.check_dm_performance:
                     logger.log(f"{self.step}-th step {sampler} sampler (NFE {step}) EMA {rate}"
                                f" FID-{self.args.eval_num_samples // 1000}k compared with DM: {self.compute_fid(mu, sigma, self.dm_mu, self.dm_sigma)}")
+                    # ORG:
+                    # self.calculate_similarity_metrics(os.path.join(get_blob_logdir(), sample_dir),
+                    #                                   num_samples=self.args.eval_num_samples, step=step, rate=rate)
                     self.calculate_similarity_metrics(os.path.join(get_blob_logdir(), sample_dir),
-                                                      num_samples=self.args.eval_num_samples, step=step, rate=rate)
+                                                      num_samples=self.args.eval_num_samples, step=step, rate=rate,
+                                                      sampler=sampler,
+                                                      )
+                    
                 if delete:
                     shutil.rmtree(os.path.join(get_blob_logdir(), sample_dir))
                 if out:
